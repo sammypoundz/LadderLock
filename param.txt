@@ -1,0 +1,1 @@
+python LadderLock.py --symbol BTCUSDm --direction BUY --tp 77397.17 --sl 77303.37 --risk 10
