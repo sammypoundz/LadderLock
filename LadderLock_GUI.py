@@ -1,11 +1,5 @@
 """
-LadderLock GUI – Exact replication of the command‑line logic
-- Auto‑connects to MT5 when the app starts
-- Places three orders with same SL, laddered TPs (TP1, TP2, TP3)
-- On TP hit, raises all stops to that TP level
-- On final TP3, closes all positions
-- On pullback to stop, closes all positions
-- Default symbol: XAUUSDm
+LadderLock GUI – Final corrected version (result.order, real‑time balance)
 """
 
 import tkinter as tk
@@ -16,482 +10,487 @@ import time
 import random
 import MetaTrader5 as mt5
 
-# -------------------------------
-# Helper: parse price (remove commas)
-# -------------------------------
-def parse_price(price_str):
-    return float(price_str.replace(',', '').strip())
+# ------------------------------- Helper functions -------------------------------
+def print_account_info():
+    account_info = mt5.account_info()
+    if account_info is None:
+        return False, "❌ Could not retrieve account info."
+    info = f"Account: {account_info.login}\nBalance: {account_info.balance:.2f} {account_info.currency}\nEquity: {account_info.equity:.2f} {account_info.currency}"
+    return True, info
 
-# -------------------------------
-# LadderLock Bot Logic (exact copy from command‑line, adapted for GUI)
-# -------------------------------
-class LadderLockBot:
-    def __init__(self, symbol, direction, tp_price, sl_price, risk_usd, entry_price, magic, status_queue):
+def calculate_volume_from_risk(symbol, entry_price, stop_loss_price, risk_usd, direction):
+    symbol_info = mt5.symbol_info(symbol)
+    if not symbol_info:
+        return None, f"Symbol {symbol} not found"
+    tick_value = symbol_info.trade_tick_value
+    tick_size = symbol_info.trade_tick_size
+    if tick_value == 0 or tick_size == 0:
+        return None, "Tick value/size zero"
+    if direction == "BUY":
+        distance = entry_price - stop_loss_price
+    else:
+        distance = stop_loss_price - entry_price
+    if distance <= 0:
+        return None, "Stop loss on wrong side of entry"
+    ticks = distance / tick_size
+    risk_per_lot = ticks * tick_value
+    volume = risk_usd / risk_per_lot
+    volume_step = symbol_info.volume_step
+    volume = round(volume / volume_step) * volume_step
+    volume = max(volume, symbol_info.volume_min)
+    volume = min(volume, symbol_info.volume_max)
+    return volume, None
+
+def calculate_profit_at_tp(entry_price, tp_price, volume, direction, symbol_info):
+    tick_size = symbol_info.trade_tick_size
+    tick_value = symbol_info.trade_tick_value
+    if direction == "BUY":
+        distance = tp_price - entry_price
+    else:
+        distance = entry_price - tp_price
+    if distance <= 0:
+        return 0
+    ticks = distance / tick_size
+    profit = ticks * tick_value * volume
+    return profit
+
+def price_for_profit(entry_price, volume, profit_usd, direction, symbol_info):
+    tick_size = symbol_info.trade_tick_size
+    tick_value = symbol_info.trade_tick_value
+    digits = symbol_info.digits
+
+    if tick_value == 0:
+        return None
+
+    points_needed = profit_usd / (volume * tick_value)
+    price_change = points_needed * tick_size
+
+    if direction == "BUY":
+        price = entry_price + price_change
+    else:
+        price = entry_price - price_change
+
+    price = round(price, digits)
+    return price
+
+def send_market_order(symbol, order_type, volume, sl_price, tp_price, magic, comment, deviation=20):
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        return None
+    if order_type == "BUY":
+        price = tick.ask
+        order_type_mt5 = mt5.ORDER_TYPE_BUY
+    else:
+        price = tick.bid
+        order_type_mt5 = mt5.ORDER_TYPE_SELL
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": volume,
+        "type": order_type_mt5,
+        "price": price,
+        "sl": sl_price,
+        "tp": tp_price,
+        "deviation": deviation,
+        "magic": magic,
+        "comment": comment,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    return mt5.order_send(request)
+
+def modify_position_sltp(position, symbol, new_sl):
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "position": position.ticket,
+        "symbol": symbol,
+        "sl": new_sl,
+        "tp": position.tp,
+    }
+    return mt5.order_send(request)
+
+def close_position(position, symbol, magic):
+    if position.type == mt5.POSITION_TYPE_BUY:
+        order_type = mt5.ORDER_TYPE_SELL
+    else:
+        order_type = mt5.ORDER_TYPE_BUY
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        return None
+    price = tick.bid if order_type == mt5.ORDER_TYPE_SELL else tick.ask
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": position.volume,
+        "type": order_type,
+        "position": position.ticket,
+        "price": price,
+        "deviation": 20,
+        "magic": magic,
+        "comment": "LadderLock close",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    return mt5.order_send(request)
+
+# ------------------------------- Bot Thread -------------------------------
+class LadderLockBotThread:
+    def __init__(self, symbol, direction, entry_price, sl_price, tp_price, risk_usd, magic, status_queue, app):
         self.symbol = symbol
-        self.direction = direction.upper()
-        self.tp_price = tp_price
-        self.sl_price = sl_price
-        self.risk_usd = risk_usd
+        self.direction = direction
         self.entry_price = entry_price
+        self.sl_price = sl_price
+        self.tp_price = tp_price
+        self.risk_usd = risk_usd
         self.magic = magic
         self.status_queue = status_queue
+        self.app = app  # to refresh balance
         self.stop_flag = False
-        self.positions = []
-        self.highest_tp_hit = 0
-        self.tp_levels = []
-        self.volume = None
+        self.step_profits = []
+        self.locked_step = 0
 
     def log(self, msg):
         self.status_queue.put(('log', msg))
 
-    def update_status(self, current_price, total_profit, stop_level=None, highest_tp=None):
+    def update_status(self, current_price, total_profit, current_stop, locked_step):
         self.status_queue.put(('status', {
             'price': current_price,
             'profit': total_profit,
-            'stop': stop_level if stop_level is not None else self.sl_price,
-            'tp_hit': self.highest_tp_hit if highest_tp is None else highest_tp
+            'stop': current_stop,
+            'locked_step': locked_step,
+            'step_profits': self.step_profits
         }))
 
-    def calculate_volume(self):
+    def run(self):
+        if not mt5.terminal_info():
+            self.log("❌ MT5 not connected. Please restart the app.")
+            return
+
+        ok, info = print_account_info()
+        if not ok:
+            self.log(info)
+            return
+        self.log("✅ MT5 connected")
+        self.log(info)
+
         symbol_info = mt5.symbol_info(self.symbol)
         if not symbol_info:
             self.log(f"❌ Symbol {self.symbol} not found")
-            return None
-        tick_value = symbol_info.trade_tick_value
-        tick_size = symbol_info.trade_tick_size
-        if not tick_value or not tick_size:
-            self.log("❌ Tick value or tick size is zero")
-            return None
-        if self.direction == "BUY":
-            distance = self.entry_price - self.sl_price
-        else:
-            distance = self.sl_price - self.entry_price
-        if distance <= 0:
-            self.log("❌ Stop loss must be on correct side of entry")
-            return None
-        ticks = distance / tick_size
-        risk_per_lot = ticks * tick_value
-        if risk_per_lot <= 0:
-            return None
-        volume = self.risk_usd / risk_per_lot
-        volume_step = symbol_info.volume_step
-        volume = round(volume / volume_step) * volume_step
-        volume = max(symbol_info.volume_min, min(symbol_info.volume_max, volume))
-        if volume < symbol_info.volume_min:
-            self.log(f"⚠️ Calculated volume {volume:.5f} below min {symbol_info.volume_min}. Using min.")
-            volume = symbol_info.volume_min
-        elif volume > symbol_info.volume_max:
-            self.log(f"⚠️ Calculated volume {volume:.5f} above max {symbol_info.volume_max}. Using max.")
-            volume = symbol_info.volume_max
-        return volume
-
-    def calculate_ladder(self):
-        num_orders = 3
-        if self.direction == "BUY":
-            step = (self.tp_price - self.entry_price) / num_orders
-            return [self.entry_price + (i+1)*step for i in range(num_orders)]
-        else:
-            step = (self.entry_price - self.tp_price) / num_orders
-            return [self.entry_price - (i+1)*step for i in range(num_orders)]
-
-    def send_market_order(self, tp):
-        tick = mt5.symbol_info_tick(self.symbol)
-        if not tick:
-            return None
-        if self.direction == "BUY":
-            price = tick.ask
-            order_type = mt5.ORDER_TYPE_BUY
-        else:
-            price = tick.bid
-            order_type = mt5.ORDER_TYPE_SELL
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": self.symbol,
-            "volume": self.volume,
-            "type": order_type,
-            "price": price,
-            "sl": self.sl_price,
-            "tp": tp,
-            "deviation": 20,
-            "magic": self.magic,
-            "comment": "LadderLock",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-        return mt5.order_send(request)
-
-    def modify_stops(self, new_sl):
-        for pos in self.positions:
-            request = {
-                "action": mt5.TRADE_ACTION_SLTP,
-                "position": pos.ticket,
-                "symbol": self.symbol,
-                "sl": new_sl,
-                "tp": None,
-            }
-            mt5.order_send(request)
-
-    def close_all(self):
-        positions = mt5.positions_get(symbol=self.symbol, magic=self.magic)
-        if not positions:
-            return
-        self.log(f"🔒 Closing {len(positions)} position(s)...")
-        for pos in positions:
-            if pos.type == mt5.POSITION_TYPE_BUY:
-                order_type = mt5.ORDER_TYPE_SELL
-            else:
-                order_type = mt5.ORDER_TYPE_BUY
-            tick = mt5.symbol_info_tick(self.symbol)
-            if not tick:
-                continue
-            price = tick.bid if order_type == mt5.ORDER_TYPE_SELL else tick.ask
-            close_request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": self.symbol,
-                "volume": pos.volume,
-                "type": order_type,
-                "position": pos.ticket,
-                "price": price,
-                "deviation": 20,
-                "magic": self.magic,
-                "comment": "LadderLock close",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-            mt5.order_send(close_request)
-        self.log("✅ All positions closed.")
-
-    def run(self):
-        # Connect to MT5 if not already connected (should be already from auto_connect)
-        if not mt5.terminal_info():
-            if not mt5.initialize():
-                self.log("❌ MT5 initialization failed. Is MetaTrader 5 running?")
-                return
-        self.log("✅ Connected to MT5")
-
-        # Symbol check
-        symbol_info = mt5.symbol_info(self.symbol)
-        if not symbol_info:
-            self.log(f"❌ Symbol {self.symbol} not found.")
             return
         if not symbol_info.visible:
-            if not mt5.symbol_select(self.symbol, True):
-                self.log(f"❌ Cannot select {self.symbol}.")
-                return
-        self.log(f"✅ Symbol {self.symbol} selected")
+            mt5.symbol_select(self.symbol, True)
 
-        # Entry price
         if self.entry_price is None:
             tick = mt5.symbol_info_tick(self.symbol)
             if not tick:
-                self.log("❌ Cannot get current price.")
+                self.log("❌ Cannot get current price")
                 return
             self.entry_price = tick.ask if self.direction == "BUY" else tick.bid
-        self.log(f"📈 Entry price: {self.entry_price:.5f}")
+        self.log(f"📈 Entry: {self.entry_price:.5f}")
 
-        # Volume
-        self.volume = self.calculate_volume()
-        if self.volume is None or self.volume <= 0:
-            self.log("❌ Failed to calculate lot size.")
-            return
-        self.log(f"⚖️ Auto-calculated volume per order: {self.volume:.5f} lots (risks ~{self.risk_usd} per position)")
-
-        # Ladder TPs
-        self.tp_levels = self.calculate_ladder()
-        self.log(f"🎯 Ladder TPs: {[round(x,5) for x in self.tp_levels]}")
-        self.log(f"🛡️ All orders share the same initial stop loss: {self.sl_price:.5f}")
-
-        # Place three orders
-        tickets = []
-        for i, tp in enumerate(self.tp_levels):
-            res = self.send_market_order(tp)
-            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                tickets.append(res.order)
-                self.log(f"✅ Order {i+1} placed | Ticket {res.order} | SL {self.sl_price:.5f} | TP {tp:.5f}")
-            else:
-                err = res.comment if res else 'no result'
-                self.log(f"❌ Order {i+1} failed: {err}")
-                mt5.shutdown()
+        if self.direction == "BUY":
+            if self.tp_price <= self.entry_price or self.sl_price >= self.entry_price:
+                self.log("❌ For BUY: TP > entry > SL")
+                return
+        else:
+            if self.tp_price >= self.entry_price or self.sl_price <= self.entry_price:
+                self.log("❌ For SELL: TP < entry < SL")
                 return
 
-        # Get positions
-        self.positions = mt5.positions_get(symbol=self.symbol, magic=self.magic)
-        if not self.positions:
-            self.log("❌ No positions found after placing orders")
+        volume, err = calculate_volume_from_risk(self.symbol, self.entry_price, self.sl_price, self.risk_usd, self.direction)
+        if volume is None:
+            self.log(f"❌ {err}")
             return
-        self.log("🚀 LadderLock is now running")
+        self.log(f"⚖️ Lot size: {volume:.5f} (risk ${self.risk_usd:.2f})")
 
-        # Monitoring loop
+        profit_at_tp = calculate_profit_at_tp(self.entry_price, self.tp_price, volume, self.direction, symbol_info)
+        self.step_profits = [profit_at_tp / 3 * i for i in (1, 2, 3)]
+        self.log(f"🎯 TP at {self.tp_price:.5f} → profit ${profit_at_tp:.2f}")
+        self.log(f"📊 Ladder: ${self.step_profits[0]:.2f}, ${self.step_profits[1]:.2f}, close at ${self.step_profits[2]:.2f}")
+
+        result = send_market_order(self.symbol, self.direction, volume, self.sl_price, self.tp_price, self.magic, "LadderLock", 20)
+        if not result or result.retcode != mt5.TRADE_RETCODE_DONE:
+            self.log(f"❌ Order failed: {result.comment if result else 'unknown'}")
+            return
+
+        # ✅ FIX: use .order (not .position)
+        ticket = result.order
+        self.log(f"✅ Position opened | Ticket: {ticket} | SL: {self.sl_price:.5f} | TP: {self.tp_price:.5f}")
+
+        time.sleep(1)
+        positions = mt5.positions_get(symbol=self.symbol, ticket=ticket)
+        if not positions:
+            self.log("❌ Position not found")
+            return
+        position = positions[0]
+
+        stops_level = symbol_info.trade_stops_level * symbol_info.point
+        digits = symbol_info.digits
+        self.log(f"🔧 Broker: min stop distance = {stops_level:.5f} ({symbol_info.trade_stops_level} points)")
+
+        self.log("🚀 Monitoring profit ladder...")
         while not self.stop_flag:
-            time.sleep(1)
+            time.sleep(0.5)
 
-            self.positions = mt5.positions_get(symbol=self.symbol, magic=self.magic)
-            if not self.positions:
-                self.log("📭 All positions closed. Exiting.")
+            # Refresh balance in GUI
+            self.app.refresh_mt5_info_once()
+
+            positions = mt5.positions_get(symbol=self.symbol, ticket=ticket)
+            if not positions:
+                self.log("📭 Position closed")
                 break
+            position = positions[0]
 
             tick = mt5.symbol_info_tick(self.symbol)
             if not tick:
                 continue
             current_price = tick.bid if self.direction == "SELL" else tick.ask
-            total_profit = sum(p.profit for p in self.positions)
+            current_profit = position.profit
 
-            # Check TP hits
-            for i in range(self.highest_tp_hit, 3):
-                target = self.tp_levels[i]
-                if self.direction == "BUY":
-                    if current_price >= target:
-                        self.highest_tp_hit = i + 1
-                        self.log(f"🔒 TP{i+1} hit at {current_price:.5f}! Raising stops to {target:.5f}")
-                        self.modify_stops(target)
-                        self.update_status(current_price, total_profit, stop_level=target, highest_tp=self.highest_tp_hit)
+            for i in range(self.locked_step, 3):
+                if current_profit >= self.step_profits[i] - 0.01:
+                    if i == 2:
+                        self.log(f"🏆 Final profit ${self.step_profits[i]:.2f} reached! Closing trade.")
+                        close_position(position, self.symbol, self.magic)
+                        self.log(f"💰 Final profit: ${current_profit:.2f}")
+                        return
+                    else:
+                        stop_price = price_for_profit(self.entry_price, volume, self.step_profits[i], self.direction, symbol_info)
+                        if stop_price is None:
+                            self.log(f"⚠️ Cannot compute stop price for ${self.step_profits[i]:.2f}")
+                            continue
+                        stop_price = round(stop_price, digits)
+
+                        # Min distance check
+                        if self.direction == "BUY":
+                            if (current_price - stop_price) < stops_level - 1e-8:
+                                self.log(f"⚠️ New SL {stop_price:.5f} too close (min {stops_level:.5f})")
+                                continue
+                        else:
+                            if (stop_price - current_price) < stops_level - 1e-8:
+                                self.log(f"⚠️ New SL {stop_price:.5f} too close (min {stops_level:.5f})")
+                                continue
+
+                        if self.direction == "BUY" and stop_price >= current_price:
+                            self.log(f"⚠️ Invalid SL for BUY: {stop_price:.5f} >= {current_price:.5f}")
+                            continue
+                        if self.direction == "SELL" and stop_price <= current_price:
+                            self.log(f"⚠️ Invalid SL for SELL: {stop_price:.5f} <= {current_price:.5f}")
+                            continue
+
+                        mod = modify_position_sltp(position, self.symbol, stop_price)
+                        if mod and mod.retcode == mt5.TRADE_RETCODE_DONE:
+                            self.log(f"🔒 Locked ${self.step_profits[i]:.2f} → SL moved to {stop_price:.5f}")
+                            self.locked_step = i + 1
+                            self.update_status(current_price, current_profit, stop_price, self.locked_step)
+                        else:
+                            if mod:
+                                self.log(f"❌ SL move failed: {mod.retcode} | {mod.comment}")
+                            else:
+                                self.log(f"❌ SL move failed: No response | MT5 error: {mt5.last_error()}")
                         break
-                else:
-                    if current_price <= target:
-                        self.highest_tp_hit = i + 1
-                        self.log(f"🔒 TP{i+1} hit at {current_price:.5f}! Raising stops to {target:.5f}")
-                        self.modify_stops(target)
-                        self.update_status(current_price, total_profit, stop_level=target, highest_tp=self.highest_tp_hit)
-                        break
 
-            # Check stop loss hit
-            stop_hit = False
-            for pos in self.positions:
-                if pos.sl is None:
-                    continue
-                if self.direction == "BUY":
-                    if current_price <= pos.sl:
-                        self.log(f"⚠️ Stop loss {pos.sl:.5f} hit at {current_price:.5f}. Closing all positions.")
-                        stop_hit = True
-                        break
-                else:
-                    if current_price >= pos.sl:
-                        self.log(f"⚠️ Stop loss {pos.sl:.5f} hit at {current_price:.5f}. Closing all positions.")
-                        stop_hit = True
-                        break
-            if stop_hit:
-                self.close_all()
-                final_positions = mt5.positions_get(symbol=self.symbol, magic=self.magic)
-                profit_locked = sum(p.profit for p in final_positions) if final_positions else total_profit
-                self.log(f"💰 Total profit locked: {profit_locked:.2f}")
-                break
+            if position.sl is not None:
+                if self.direction == "BUY" and current_price <= position.sl:
+                    self.log(f"⚠️ Stop hit at {current_price:.5f}, profit: ${current_profit:.2f}")
+                    close_position(position, self.symbol, self.magic)
+                    break
+                elif self.direction == "SELL" and current_price >= position.sl:
+                    self.log(f"⚠️ Stop hit at {current_price:.5f}, profit: ${current_profit:.2f}")
+                    close_position(position, self.symbol, self.magic)
+                    break
 
-            # Final TP3 reached
-            if self.highest_tp_hit >= 3:
-                self.log("🏆 Final TP3 reached! Closing all positions immediately.")
-                self.close_all()
-                break
+            self.update_status(current_price, current_profit, position.sl or self.sl_price, self.locked_step)
 
-            # Update GUI status
-            current_stop = self.positions[0].sl if self.positions and self.positions[0].sl else self.sl_price
-            self.update_status(current_price, total_profit, stop_level=current_stop)
+        self.log("🔚 Bot finished.")
 
-        self.log("🔚 LadderLock finished.")
-        mt5.shutdown()
-
-# -------------------------------
-# GUI Application (with auto-connect on launch)
-# -------------------------------
+# ------------------------------- GUI -------------------------------
 class LadderLockApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("LadderLock Bot")
-        self.root.geometry("950x700")
-        self.root.resizable(True, True)
-
-        self.bot_thread = None
-        self.bot = None
+        self.root.title("LadderLock – TP/SL inputs, risk‑based lot size")
+        self.root.geometry("1000x750")
         self.status_queue = queue.Queue()
-
+        self.bot = None
+        self.bot_thread = None
         self.create_widgets()
         self.update_from_queue()
-        # Auto‑connect to MT5 when the app starts
         self.auto_connect()
 
     def create_widgets(self):
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        main = ttk.Frame(self.root, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
 
-        # Left: Connection info
-        left_frame = ttk.LabelFrame(main_frame, text="CONNECTION", padding="5")
-        left_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        conn_frame = ttk.LabelFrame(main, text="CONNECTION", padding=5)
+        conn_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        self.conn_status = ttk.Label(conn_frame, text="⏳ Connecting...", foreground="orange")
+        self.conn_status.pack(anchor=tk.W)
+        self.account_label = ttk.Label(conn_frame, text="Account: --")
+        self.account_label.pack(anchor=tk.W)
+        self.balance_label = ttk.Label(conn_frame, text="Balance: --")
+        self.balance_label.pack(anchor=tk.W)
 
-        self.conn_status = ttk.Label(left_frame, text="⏳ Connecting...", foreground="orange")
-        self.conn_status.pack(anchor=tk.W, pady=2)
-        self.account_label = ttk.Label(left_frame, text="Account: --")
-        self.account_label.pack(anchor=tk.W, pady=2)
-        self.balance_label = ttk.Label(left_frame, text="Balance: --")
-        self.balance_label.pack(anchor=tk.W, pady=2)
-        self.equity_label = ttk.Label(left_frame, text="Equity: --")
-        self.equity_label.pack(anchor=tk.W, pady=2)
-
-        # Right: Trade parameters
-        right_frame = ttk.LabelFrame(main_frame, text="TRADE PARAMETERS", padding="5")
-        right_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
-
-        ttk.Label(right_frame, text="Symbol:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        trade_frame = ttk.LabelFrame(main, text="TRADE PARAMETERS", padding=5)
+        trade_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
+        ttk.Label(trade_frame, text="Symbol:").grid(row=0, column=0, sticky=tk.W)
         self.symbol_var = tk.StringVar(value="XAUUSDm")
-        self.symbol_entry = ttk.Entry(right_frame, textvariable=self.symbol_var, width=15)
-        self.symbol_entry.grid(row=0, column=1, sticky=tk.W, pady=2)
+        ttk.Entry(trade_frame, textvariable=self.symbol_var, width=12).grid(row=0, column=1, sticky=tk.W)
 
-        ttk.Label(right_frame, text="Direction:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        ttk.Label(trade_frame, text="Direction:").grid(row=1, column=0, sticky=tk.W)
         self.direction_var = tk.StringVar(value="BUY")
-        ttk.Radiobutton(right_frame, text="BUY", variable=self.direction_var, value="BUY").grid(row=1, column=1, sticky=tk.W)
-        ttk.Radiobutton(right_frame, text="SELL", variable=self.direction_var, value="SELL").grid(row=1, column=2, sticky=tk.W)
+        ttk.Radiobutton(trade_frame, text="BUY", variable=self.direction_var, value="BUY").grid(row=1, column=1, sticky=tk.W)
+        ttk.Radiobutton(trade_frame, text="SELL", variable=self.direction_var, value="SELL").grid(row=1, column=2, sticky=tk.W)
 
-        ttk.Label(right_frame, text="Final TP (price):").grid(row=2, column=0, sticky=tk.W, pady=2)
-        self.tp_var = tk.StringVar()
-        self.tp_entry = ttk.Entry(right_frame, textvariable=self.tp_var, width=15)
-        self.tp_entry.grid(row=2, column=1, sticky=tk.W, pady=2)
-
-        ttk.Label(right_frame, text="Final SL (price):").grid(row=3, column=0, sticky=tk.W, pady=2)
-        self.sl_var = tk.StringVar()
-        self.sl_entry = ttk.Entry(right_frame, textvariable=self.sl_var, width=15)
-        self.sl_entry.grid(row=3, column=1, sticky=tk.W, pady=2)
-
-        ttk.Label(right_frame, text="Risk per position ($):").grid(row=4, column=0, sticky=tk.W, pady=2)
-        self.risk_var = tk.StringVar(value="10.0")
-        self.risk_entry = ttk.Entry(right_frame, textvariable=self.risk_var, width=15)
-        self.risk_entry.grid(row=4, column=1, sticky=tk.W, pady=2)
-
-        ttk.Label(right_frame, text="Entry price (optional):").grid(row=5, column=0, sticky=tk.W, pady=2)
+        ttk.Label(trade_frame, text="Entry price (optional):").grid(row=2, column=0, sticky=tk.W)
         self.entry_var = tk.StringVar()
-        self.entry_entry = ttk.Entry(right_frame, textvariable=self.entry_var, width=15)
-        self.entry_entry.grid(row=5, column=1, sticky=tk.W, pady=2)
-        ttk.Label(right_frame, text="(leave empty = market)").grid(row=5, column=2, sticky=tk.W)
+        ttk.Entry(trade_frame, textvariable=self.entry_var, width=12).grid(row=2, column=1, sticky=tk.W)
+        ttk.Label(trade_frame, text="(empty = market)").grid(row=2, column=2, sticky=tk.W)
 
-        btn_frame = ttk.Frame(right_frame)
+        ttk.Label(trade_frame, text="Stop Loss (price):").grid(row=3, column=0, sticky=tk.W)
+        self.sl_var = tk.StringVar()
+        ttk.Entry(trade_frame, textvariable=self.sl_var, width=12).grid(row=3, column=1, sticky=tk.W)
+
+        ttk.Label(trade_frame, text="Take Profit (price):").grid(row=4, column=0, sticky=tk.W)
+        self.tp_var = tk.StringVar()
+        ttk.Entry(trade_frame, textvariable=self.tp_var, width=12).grid(row=4, column=1, sticky=tk.W)
+
+        ttk.Label(trade_frame, text="Risk amount ($):").grid(row=5, column=0, sticky=tk.W)
+        self.risk_var = tk.StringVar(value="30")
+        ttk.Entry(trade_frame, textvariable=self.risk_var, width=12).grid(row=5, column=1, sticky=tk.W)
+
+        btn_frame = ttk.Frame(trade_frame)
         btn_frame.grid(row=6, column=0, columnspan=3, pady=10)
         self.start_btn = ttk.Button(btn_frame, text="START BOT", command=self.start_bot)
         self.start_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn = ttk.Button(btn_frame, text="STOP BOT", command=self.stop_bot, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
 
-        # Live status
-        live_frame = ttk.LabelFrame(main_frame, text="LIVE STATUS", padding="5")
-        live_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+        ladder_frame = ttk.LabelFrame(main, text="PROFIT LADDER", padding=5)
+        ladder_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.ladder_canvas = tk.Canvas(ladder_frame, height=80, bg='white')
+        self.ladder_canvas.pack(fill=tk.X, expand=True)
 
-        self.price_label = ttk.Label(live_frame, text="Current Price: --", font=('Arial', 10, 'bold'))
-        self.price_label.pack(anchor=tk.W, pady=2)
-        self.tp_hit_label = ttk.Label(live_frame, text="Highest TP hit: 0/3")
-        self.tp_hit_label.pack(anchor=tk.W, pady=2)
-        self.stop_label = ttk.Label(live_frame, text="Stop loss now: --")
-        self.stop_label.pack(anchor=tk.W, pady=2)
-        self.profit_label = ttk.Label(live_frame, text="Total Profit: 0.00", foreground="green")
-        self.profit_label.pack(anchor=tk.W, pady=2)
+        live_frame = ttk.LabelFrame(main, text="LIVE STATUS", padding=5)
+        live_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.price_label = ttk.Label(live_frame, text="Price: --")
+        self.price_label.pack(anchor=tk.W)
+        self.stop_label = ttk.Label(live_frame, text="Stop loss: --")
+        self.stop_label.pack(anchor=tk.W)
+        self.profit_label = ttk.Label(live_frame, text="Profit: 0.00", foreground="green")
+        self.profit_label.pack(anchor=tk.W)
 
-        # Log panel
-        log_frame = ttk.LabelFrame(main_frame, text="LOG / EVENTS", padding="5")
-        log_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
-
-        self.log_text = tk.Text(log_frame, height=12, wrap=tk.WORD, bg="white", fg="black")
+        log_frame = ttk.LabelFrame(main, text="LOG", padding=5)
+        log_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+        self.log_text = tk.Text(log_frame, height=12, wrap=tk.WORD)
         scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scroll.set)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=2)
-        main_frame.rowconfigure(0, weight=0)
-        main_frame.rowconfigure(1, weight=1)
-        main_frame.rowconfigure(2, weight=2)
+        main.columnconfigure(0, weight=1)
+        main.columnconfigure(1, weight=2)
+        main.rowconfigure(3, weight=1)
 
     def auto_connect(self):
-        """Background thread: initialise MT5 and update connection panel."""
-        def connect_task():
+        def connect():
             if not mt5.initialize():
-                self.root.after(0, lambda: self.update_connection_display(False, None))
-                self.root.after(0, lambda: self.log_text.insert(tk.END, "[Auto‑connect] ❌ MT5 initialization failed. Is MetaTrader 5 running?\n"))
+                self.root.after(0, lambda: self.conn_status.config(text="❌ MT5 init failed", foreground="red"))
                 return
-            acc = mt5.account_info()
-            if acc:
-                self.root.after(0, lambda: self.update_connection_display(True, acc))
-                self.root.after(0, lambda: self.log_text.insert(tk.END, f"[Auto‑connect] ✅ Connected to account {acc.login} (balance {acc.balance:.2f} {acc.currency})\n"))
-                # Start periodic refresh
-                self.root.after(2000, self.refresh_mt5_info)
+            ok, info = print_account_info()
+            if ok:
+                self.root.after(0, lambda: self.update_conn(True, info))
+                self.refresh_mt5_info()
             else:
-                self.root.after(0, lambda: self.update_connection_display(False, None))
-                self.root.after(0, lambda: self.log_text.insert(tk.END, "[Auto‑connect] ⚠️ MT5 is running but no account is logged in.\n"))
-        threading.Thread(target=connect_task, daemon=True).start()
+                self.root.after(0, lambda: self.update_conn(False, info))
+        threading.Thread(target=connect, daemon=True).start()
 
-    def update_connection_display(self, connected, account_info):
-        if connected and account_info:
+    def update_conn(self, ok, info):
+        if ok:
             self.conn_status.config(text="✅ Connected", foreground="green")
-            self.account_label.config(text=f"Account: {account_info.login}")
-            self.balance_label.config(text=f"Balance: {account_info.balance:.2f} {account_info.currency}")
-            self.equity_label.config(text=f"Equity: {account_info.equity:.2f} {account_info.currency}")
+            for line in info.split('\n'):
+                if "Account:" in line:
+                    self.account_label.config(text=line)
+                elif "Balance:" in line:
+                    self.balance_label.config(text=line)
         else:
             self.conn_status.config(text="❌ Not connected", foreground="red")
-            self.account_label.config(text="Account: --")
-            self.balance_label.config(text="Balance: --")
-            self.equity_label.config(text="Equity: --")
+            self.log_text.insert(tk.END, f"[Connect] {info}\n")
 
     def refresh_mt5_info(self):
-        """Periodic update of connection info (balance/equity)."""
+        """Periodic refresh (every 2 seconds)"""
+        self.refresh_mt5_info_once()
+        self.root.after(2000, self.refresh_mt5_info)
+
+    def refresh_mt5_info_once(self):
+        """Called from bot thread to update balance in real time."""
         try:
             if mt5.terminal_info():
                 acc = mt5.account_info()
                 if acc:
-                    self.conn_status.config(text="✅ Connected", foreground="green")
                     self.account_label.config(text=f"Account: {acc.login}")
                     self.balance_label.config(text=f"Balance: {acc.balance:.2f} {acc.currency}")
-                    self.equity_label.config(text=f"Equity: {acc.equity:.2f} {acc.currency}")
+                    self.conn_status.config(text="✅ Connected", foreground="green")
                 else:
                     self.conn_status.config(text="⚠️ Not logged in", foreground="orange")
             else:
                 self.conn_status.config(text="❌ MT5 not running", foreground="red")
         except:
             pass
-        self.root.after(2000, self.refresh_mt5_info)
+
+    def update_ladder(self, locked_step, step_profits):
+        self.ladder_canvas.delete("all")
+        w = self.ladder_canvas.winfo_width()
+        if w < 10:
+            w = 400
+        step_w = w // 3
+        for i in range(3):
+            x0 = i * step_w
+            x1 = (i+1) * step_w - 2
+            color = "lightgreen" if locked_step > i else "lightgray"
+            self.ladder_canvas.create_rectangle(x0, 10, x1, 70, fill=color, outline="black")
+            self.ladder_canvas.create_text((x0+x1)//2, 40, text=f"${step_profits[i]:.0f}", font=('Arial', 10, 'bold'))
+            if locked_step > i:
+                self.ladder_canvas.create_text((x0+x1)//2, 65, text="LOCKED", fill="darkgreen", font=('Arial', 8))
 
     def update_from_queue(self):
         try:
             while True:
-                msg_type, data = self.status_queue.get_nowait()
-                if msg_type == 'log':
+                typ, data = self.status_queue.get_nowait()
+                if typ == 'log':
                     self.log_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {data}\n")
                     self.log_text.see(tk.END)
-                elif msg_type == 'status':
-                    self.price_label.config(text=f"Current Price: {data['price']:.5f}")
-                    self.tp_hit_label.config(text=f"Highest TP hit: {data['tp_hit']}/3")
-                    self.stop_label.config(text=f"Stop loss now: {data['stop']:.5f}")
+                elif typ == 'status':
+                    self.price_label.config(text=f"Price: {data['price']:.5f}")
+                    self.stop_label.config(text=f"Stop loss: {data['stop']:.5f}")
                     profit = data['profit']
-                    color = "green" if profit >= 0 else "red"
-                    self.profit_label.config(text=f"Total Profit: {profit:.2f}", foreground=color)
+                    self.profit_label.config(text=f"Profit: {profit:.2f}", foreground="green" if profit >= 0 else "red")
+                    self.update_ladder(data['locked_step'], data['step_profits'])
         except queue.Empty:
             pass
         self.root.after(200, self.update_from_queue)
 
     def start_bot(self):
-        symbol = self.symbol_var.get().strip()
-        direction = self.direction_var.get()
         try:
-            tp = parse_price(self.tp_var.get())
-            sl = parse_price(self.sl_var.get())
+            symbol = self.symbol_var.get().strip()
+            direction = self.direction_var.get()
+            sl = float(self.sl_var.get())
+            tp = float(self.tp_var.get())
             risk = float(self.risk_var.get())
+            entry = float(self.entry_var.get()) if self.entry_var.get().strip() else None
         except ValueError as e:
-            messagebox.showerror("Invalid Input", f"Please check numbers (commas allowed): {e}")
+            messagebox.showerror("Input error", f"Invalid number: {e}")
             return
-        entry = None
-        if self.entry_var.get().strip():
-            try:
-                entry = parse_price(self.entry_var.get())
-            except ValueError:
-                messagebox.showerror("Invalid Input", "Entry price must be a number (commas allowed)")
-                return
 
         if risk <= 0:
-            messagebox.showerror("Invalid Risk", "Risk must be positive")
+            messagebox.showerror("Risk", "Risk must be > 0")
             return
 
-        # Ensure MT5 is still connected (auto_connect already initialised it)
         if not mt5.terminal_info():
             if not mt5.initialize():
-                messagebox.showerror("MT5 Error", "MT5 is not running or cannot connect.")
+                messagebox.showerror("MT5", "Cannot connect to MT5")
                 return
-        acc = mt5.account_info()
-        if not acc:
-            messagebox.showerror("MT5 Error", "No account logged in. Please log into MT5 first.")
+        if not mt5.account_info():
+            messagebox.showerror("MT5", "No account logged in")
             return
 
         self.start_btn.config(state=tk.DISABLED)
@@ -499,14 +498,12 @@ class LadderLockApp:
         self.log_text.delete(1.0, tk.END)
 
         magic = random.randint(100000, 999999)
-        self.bot = LadderLockBot(symbol, direction, tp, sl, risk, entry, magic, self.status_queue)
+        self.bot = LadderLockBotThread(symbol, direction, entry, sl, tp, risk, magic, self.status_queue, self)
         self.bot_thread = threading.Thread(target=self.bot.run, daemon=True)
         self.bot_thread.start()
 
     def stop_bot(self):
         if self.bot:
-            self.bot.log("🛑 Stop command received. Closing all positions...")
-            self.bot.close_all()
             self.bot.stop_flag = True
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)

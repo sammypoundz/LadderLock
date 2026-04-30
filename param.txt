@@ -1,1 +1,1 @@
-python LadderLock.py --symbol BTCUSDm --direction BUY --tp 78168.72 --sl 77932.28 --risk 10
+python LadderLock.py --symbol XAUUSDm --direction SELL --tp 4617.678 --sl 4638.619 --risk 3
